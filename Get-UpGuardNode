@@ -1,0 +1,320 @@
+#!/usr/local/bin/pwsh
+#Requires -Version 3
+
+# Enumerate all Node Groups, and their Scan Policies in UpGuard
+# Largely based on https://github.com/ScriptRock/content/blob/master/code/api/powershell/list_nodes.ps1
+# Usage Instructions:
+#   - To use, please input the Authorization parameters above for URL, api_key, and secret_key
+#   - Minimum Requirements: Powershell 3 and up
+#
+# Optional Parameters:
+#   - formatJSON: Returns results in JSON format
+#   - skipTLScheck: Disables TLS Certificate check for the API call.
+#   - DebugUG: enables customized debugging output (Not PowerShell debugging).
+#
+# Example Usage:
+#   - Dot-Sources all functions in this script
+#     . ./path_to_script/Get-UpGuardNode.ps1:
+#   - List all Nodes:
+#     Get-Node
+#   - List all Nodes Groups and output JSON format:
+#     Get-NodeGroup -formatJSON
+#    
+# [CmdletBinding()]
+Set-StrictMode -Version latest
+
+# Authorization
+$url        = 'https://upguard/' # Example: https://123.0.0.1 or http://<my-server>.com
+$api_key    = 'ef97ec03b83ef79bf2523a569d2258d8e06abe1ef2d926e799c98fef8a617940' # Service API key under Manage Accounts | Account
+$secret_key = '5aee38f0a3036a6366a8fddd4f79d261c3ed3bd6d24a1d91c49b785b3e6f0e26' # Secret key shown when API enabled in Manage Accounts | Account | Enable API Access
+
+# Added serializer for parsing large JSON responses
+Add-Type -AssemblyName System.Web.Extensions
+$json = New-Object -TypeName System.Web.Script.Serialization.JavaScriptSerializer
+$json.MaxJsonLength = 104857600 #100mb as bytes, default is 2mb
+
+function Write-OptionalDebug {
+    param([string]$output)
+    if ($DebugUG) {
+        Write-Host $output
+    }
+}
+
+function Set-CertificateValidation {
+    <#
+        This function enables or disables TLS Cert validation in your PowerShell session.  Calling this affects TLS validation for ALL function calls in the session!
+        
+        Optional Flag
+        - Disable: If specified, validation is disabled.  If not specified (the default) validation is re-enabled.
+        
+        Examples
+        - Disable TLS Cert validation
+            Set-CertificateValidation -Disable
+
+        - Re-enable TLS Cert validation
+            Set-CertificateValidation
+    #>
+     param([switch] $Disable)
+    $type = [AppDomain]::CurrentDomain.GetAssemblies().ExportedTypes | Where-Object { $_.Name -ieq "TrustAllCertsPolicy" }
+  
+    if ( !$type ) {
+    #  Disable TLS Certificate validation:
+    Add-Type -TypeDefinition @"
+        using System.Net;
+        using System.Security.Cryptography.X509Certificates;
+        public class TrustAllCertsPolicy : ICertificatePolicy 
+        {
+            public bool CheckValidationResult(ServicePoint srvPoint, X509Certificate certificate,WebRequest request, int certificateProblem) 
+            {
+                return true;
+            }
+        }
+"@
+    }
+
+  if ( $Disable ) {
+    [System.Net.ServicePointManager]::CertificatePolicy = New-Object -TypeName TrustAllCertsPolicy
+  } else {
+    [System.Net.ServicePointManager]::CertificatePolicy = $null
+  }
+}
+
+function Invoke-UpGuardApi {
+    param(
+        [string]$Url         = $url,
+        [string]$SecretKey   = $secret_key,
+        [string]$ApiKey      = $api_key,
+        [string]$RequestPath = $null,
+        [string]$FullPath    = $null,
+        [string]$Method       = "GET"
+    )
+
+    # Encryption Protocol Setting
+    Write-OptionalDebug "Enforcing TLS 1.2"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    
+    if ($RequestPath -eq $null -and $FullPath -eq $null) {
+        throw [System.Exception] "Must provide one of -RequestPath or -FullPath"
+    }
+
+    $headers = @{'Authorization' = 'Token token="' + $ApiKey + $SecretKey + '"'} #; 'Accept' = 'application/json'}
+   
+    $uri = ''
+
+    if ($FullPath -ne $null -and $FullPath -ne '') {
+        if (-not ($FullPath -match ".*\.json.*")) {
+            $components = $FullPath.Split("?")
+            $FullPath = "$($components[0]).json?$($components[1])"
+        }
+        $uri = $FullPath
+    } else {
+        $uri = "$Url/$RequestPath"
+    }
+    
+    Write-OptionalDebug "Attempting to invoke $uri with $Method"
+
+    try {
+        $req = Invoke-RestMethod -Uri $uri -Method $Method -Headers $headers #-UseBasicParsing
+    } catch {
+        $result = $_.Exception.Response.GetResponseStream()
+        $reader = New-Object System.IO.StreamReader($result)
+        $reader.BaseStream.Position = 0
+        $reader.DiscardBufferedData()
+        $responseBody = $reader.ReadToEnd();
+        $respJson = ConvertFrom-Json $responseBody
+        Write-Output "Got Status Code $($_.Exception.Response.StatusCode): $($respJson."error")"
+        break
+    }
+    $req
+}
+
+function Get-Node {
+    # REST API reference online: https://support.upguard.com/upguard/nodes-api-v2.html
+    # Optional API Query Input Flags: 
+    #   - status: Filters node list by active, deleted, or detected status.
+    #     Inputs: active, deleted, detected
+    #   - lastScanStatus: Filters node list by result of the last scan of that node.
+    #     Inputs: success, failure, offline, timeout, error, exception, all_failures
+    [CmdletBinding()]
+    param(
+        [Parameter( Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $node_group_name = 'All Nodes',
+        [ValidateSet('active', 'deleted', 'detected')]
+        [string]
+        $status = 'active',
+        [ValidateSet('success', 'failure', 'offline', 'timeout', 'error', 'exception', 'all_failures')]
+        [string]
+        $lastScanStatus = 'success',
+        [switch]
+        $skipTLScheck = $false,
+        [switch]
+        $formatJSON = $false,
+        [switch]
+        $DebugUG = $false
+    )
+
+    # TLS Certificate Check
+    if($skipTLScheck) {
+        Set-CertificateValidation -Disable
+        Write-OptionalDebug "TLS Certificate checking is disabled"
+    } else {
+        Write-OptionalDebug "TLS Certificate checking is enabled"
+    }
+
+    # Encryption Protocol Setting
+    Write-OptionalDebug "Enforcing TLS 1.2"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    
+    $page      = 1
+    $perPage   = 500
+    $nodeCount = $perPage
+    $nodeArr   = @() # Nodes are stored in an array for reuse
+
+    $statusString = ""
+    if($status -ne "") {
+        $statusString = "&status=$($status)"
+    }
+
+    $lastScanString = ""
+    if($lastScanStatus -ne  "") {
+       $lastScanString = "&lastScanStatus=$($lastScanStatus)"
+    }
+    
+    while($nodeCount -eq $perPage) {
+        $nodes = Invoke-UpGuardApi -RequestPath "api/v2/nodes.json?page=$($page)&per_page=$($perPage)$($statusString)$($lastScanString)"
+        $nodeCount = $nodes.Length
+        ForEach($node in $nodes) {
+            $nodeArr += $node
+        }
+        $page++
+    }
+
+    if($formatJSON) {
+        $nodeArr | ConvertTo-Json
+    } else {
+        Write-OptionalDebug "Retrieved $($nodeArr.count) nodes`n"
+        Write-Output $nodeArr
+    }
+}
+
+function Get-NodeGroup {
+    # REST API reference online: https://support.upguard.com/upguard/node-groups-api-v2.html
+    # TLS Certificate Validation Behavior
+    if($skipTLScheck) {
+        Set-CertificateValidation -Disable
+        Write-OptionalDebug "TLS Certificate checking is disabled"
+    } else {
+        Write-OptionalDebug "TLS Certificate checking is enabled"
+    }
+
+    # Encryption Protocol Setting
+    Write-OptionalDebug "Enforcing TLS 1.2"
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        
+    $page      = 1
+    $perPage   = 500
+    $nodeCount = $perPage
+    $nodeArr   = @() # Nodes are stored in an array for reuse
+
+    $statusString = ""
+    if($status -ne "") {
+        $statusString = "&status=$($status)"
+    }
+
+    $lastScanString = ""
+    if($lastScanStatus -ne  "") {
+       $lastScanString = "&lastScanStatus=$($lastScanStatus)"
+    }
+    
+    while($nodeCount -eq $perPage) {
+        $nodes = Invoke-UpGuardApi -RequestPath "api/v2/node_groups.json?page=$($page)&per_page=$($perPage)$($statusString)$($lastScanString)"
+        $nodeCount = $nodes.Length
+        ForEach($node in $nodes) {
+            $nodeArr += $node
+        }
+        $page++
+    }
+
+    if($formatJSON) {
+        $nodeArr | ConvertTo-Json
+    } else {
+        Write-OptionalDebug "Retrieved $($nodeArr.count) nodes`n"
+        Write-Output $nodeArr
+    }
+}
+
+function Get-NodeGroupID {
+    # REST API reference online: https://support.upguard.com/upguard/node-groups-api-v2.html#lookup
+    [CmdletBinding()]
+    param(
+        [Parameter( Mandatory, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]
+        $node_group_name = 'All Nodes',
+        [switch]
+        $skipTLScheck = $false,
+        [switch]
+        $formatJSON = $false
+    )
+
+    # TLS Certificate Check
+    if($skipTLScheck) {
+        Set-CertificateValidation -Disable
+        Write-OptionalDebug "TLS Certificate checking is disabled"
+    } else {
+        Write-OptionalDebug "TLS Certificate checking is enabled"
+    }
+
+    $ResponseJSON = Invoke-UpGuardApi -RequestPath ('api/v2/node_groups/lookup.json?name={0}' -f $node_group_name)
+
+    if($formatJSON) {
+        $ResponseJSON | ConvertTo-Json
+    } else {
+        #Write-OptionalDebug "Retrieved $($ResponseJSON.count) nodes`n"
+        #Write-Output $ResponseJSON
+
+        #'Optimize New-Object invocation, based on Don Jones' recommendation: https://technet.microsoft.com/en-us/magazine/hh750381.aspx
+        $properties = [ordered]@{
+            'Node_Group_Name'    = $node_group_name
+            'Node_Group_ID'      = $ResponseJSON.node_group_id
+        }
+        return New-Object -TypeName PSObject -Property $properties
+    }
+
+}
+
+function Get-NodeGroupConfiguration {
+    # REST API reference online: https://support.upguard.com/upguard/node-groups-api-v2.html#node-group-configuration
+    [CmdletBinding()]
+    param(
+        [Parameter( Mandatory, Position = 0)]
+        [ValidateRange(2,9999)]
+        [int]
+        $node_group_id = '2',
+        [Parameter(Position = 1)]
+        [switch]
+        $skipTLScheck = $false,
+        [Parameter( Position = 2)]
+        [switch]
+        $formatJSON = $false
+    )
+
+    # TLS Certificate Check
+    if($skipTLScheck) {
+        Set-CertificateValidation -Disable
+        Write-OptionalDebug "TLS Certificate checking is disabled"
+    } else {
+        Write-OptionalDebug "TLS Certificate checking is enabled"
+    }
+
+    Write-OptionalDebug "`$ResponseJSON = Invoke-UpGuardApi -RequestPath ('/api/v2/node_groups/{0}/node_group_configuration.json' -f $node_group_id)"
+    $ResponseJSON = Invoke-UpGuardApi -RequestPath ('/api/v2/node_groups/{0}/node_group_configuration.json' -f $node_group_id)
+
+    if($formatJSON) {
+        $ResponseJSON | ConvertTo-Json
+    } else {
+        Write-Output $ResponseJSON
+    }
+}
