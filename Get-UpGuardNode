@@ -25,8 +25,8 @@ Set-StrictMode -Version latest
 
 # Authorization
 $url        = 'https://upguard/' # Example: https://123.0.0.1 or http://<my-server>.com
-$api_key    = 'ef97ec03b83ef79bf2523a569d2258d8e06abe1ef2d926e799c98fef8a617940' # Service API key under Manage Accounts | Account
-$secret_key = '5aee38f0a3036a6366a8fddd4f79d261c3ed3bd6d24a1d91c49b785b3e6f0e26' # Secret key shown when API enabled in Manage Accounts | Account | Enable API Access
+$api_key    = '' # Service API key under Manage Accounts | Account
+$secret_key = '' # Secret key shown when API enabled in Manage Accounts | Account | Enable API Access
 
 # Added serializer for parsing large JSON responses
 Add-Type -AssemblyName System.Web.Extensions
